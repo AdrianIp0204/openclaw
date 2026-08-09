@@ -31,8 +31,7 @@ function splitLines(content: string): string[] {
   return content
     .trim()
     .split(/\r\n|\n|\r/)
-    .map((line) => line.trim())
-    .filter(Boolean);
+    .filter((line) => line.trim().length > 0);
 }
 
 function normalizeLineKey(line: string): string {
@@ -75,7 +74,7 @@ export function prepareDailyMemoryFlushAppend(params: {
 
   if (
     params.semanticPolicy?.rejectHeadings === true &&
-    proposedLines.some((line) => MARKDOWN_HEADING_OR_SCAFFOLD_LINE_RE.test(line))
+    proposedLines.some((line) => MARKDOWN_HEADING_OR_SCAFFOLD_LINE_RE.test(line.trim()))
   ) {
     throw memoryFlushAppendRejected(
       "markdown headings or daily-memory scaffolds are disabled by policy; append only new note lines.",

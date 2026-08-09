@@ -25,7 +25,10 @@ import { setActivePluginRegistry } from "../../plugins/runtime.js";
 import type { TemplateContext } from "../templating.js";
 import type { ReplyPayload } from "../types.js";
 import { runMemoryFlushIfNeeded, runPreflightCompactionIfNeeded } from "./agent-runner-memory.js";
-import { setAgentRunnerMemoryTestDeps } from "./agent-runner-memory.test-support.js";
+import {
+  memoryFlushTargetTestApi,
+  setAgentRunnerMemoryTestDeps,
+} from "./agent-runner-memory.test-support.js";
 import { createTestFollowupRun, writeTestSessionStore } from "./agent-runner.test-fixtures.js";
 import type { ReplyOperation } from "./reply-run-registry.js";
 
@@ -37,6 +40,7 @@ const refreshQueuedFollowupSessionMock = vi.fn();
 const incrementCompactionCountMock = vi.fn();
 const ensureSelectedAgentHarnessPluginMock = vi.fn();
 const ensureMemoryFlushTargetFileMock = vi.fn();
+const readMemoryFlushTargetFileMock = vi.fn();
 const emitAgentEventMock = vi.fn();
 const registerAgentRunContextMock = vi.fn();
 const TEST_MAX_FLUSH_FAILURES = 3;
@@ -243,6 +247,31 @@ function requireCompactEmbeddedAgentSessionCall(index = 0) {
 }
 
 describe("runMemoryFlushIfNeeded", () => {
+  it.runIf(process.platform !== "win32")(
+    "rejects a symlink target before the production memory-flush pre-read",
+    async () => {
+      const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-memory-alias-"));
+      const outsideDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-memory-outside-"));
+      await fs.mkdir(path.join(workspaceDir, "memory"));
+      const outsidePath = path.join(outsideDir, "outside.md");
+      await fs.writeFile(outsidePath, "outside secret");
+      await fs.symlink(outsidePath, path.join(workspaceDir, "memory", "2026-08-09.md"));
+
+      await expect(
+        memoryFlushTargetTestApi.ensure({
+          workspaceDir,
+          relativePath: "memory/2026-08-09.md",
+        }),
+      ).rejects.toThrow();
+      await expect(
+        memoryFlushTargetTestApi.read({
+          workspaceDir,
+          relativePath: "memory/2026-08-09.md",
+        }),
+      ).rejects.toThrow();
+      await expect(fs.readFile(outsidePath, "utf8")).resolves.toBe("outside secret");
+    },
+  );
   let rootDir = "";
 
   beforeEach(async () => {
@@ -334,6 +363,16 @@ describe("runMemoryFlushIfNeeded", () => {
     runEmbeddedAgentMock.mockReset().mockResolvedValue({ payloads: [], meta: {} });
     refreshQueuedFollowupSessionMock.mockReset();
     ensureMemoryFlushTargetFileMock.mockReset().mockResolvedValue(undefined);
+    readMemoryFlushTargetFileMock.mockReset().mockImplementation(async (params) => {
+      try {
+        return await fs.readFile(path.join(params.workspaceDir, params.relativePath), "utf8");
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          return "";
+        }
+        throw error;
+      }
+    });
     ensureSelectedAgentHarnessPluginMock.mockReset().mockResolvedValue(undefined);
     emitAgentEventMock.mockReset();
     registerAgentRunContextMock.mockReset();
@@ -361,6 +400,7 @@ describe("runMemoryFlushIfNeeded", () => {
       runEmbeddedAgentEntry: runEmbeddedAgentEntryMock as never,
       runEmbeddedAgent: runEmbeddedAgentMock as never,
       ensureMemoryFlushTargetFile: ensureMemoryFlushTargetFileMock as never,
+      readMemoryFlushTargetFile: readMemoryFlushTargetFileMock as never,
       refreshQueuedFollowupSession: refreshQueuedFollowupSessionMock as never,
       incrementCompactionCount: incrementCompactionCountMock as never,
       registerAgentRunContext: registerAgentRunContextMock as never,

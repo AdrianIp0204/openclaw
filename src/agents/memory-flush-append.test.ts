@@ -48,6 +48,15 @@ describe("prepareDailyMemoryFlushAppend", () => {
     ).toMatchObject({ status: "accepted", content, skippedDuplicateLines: 0 });
   });
 
+  it("preserves indentation in accepted Markdown", () => {
+    const content = "- parent note\n  - child note\n    code sample";
+    expect(prepareDailyMemoryFlushAppend({ content, existingContent: "" })).toMatchObject({
+      status: "accepted",
+      content,
+      appendedLines: 3,
+    });
+  });
+
   it.each([
     "# Memory - 2026-08-01\n- compact note",
     "Memory - 2026-08-01\n===================",

@@ -1,6 +1,5 @@
 /** Preflight compaction and memory flush helpers for agent runner sessions. */
 import crypto from "node:crypto";
-import fs from "node:fs";
 import path from "node:path";
 import {
   normalizeLowercaseStringOrEmpty,
@@ -53,6 +52,7 @@ import { isAbortError } from "../../infra/abort-signal.js";
 import { emitAgentEvent } from "../../infra/agent-events.js";
 import { registerAgentRunContext } from "../../infra/agent-run-registry.js";
 import { formatErrorMessage } from "../../infra/errors.js";
+import { root as fsRoot, FsSafeError } from "../../infra/fs-safe.js";
 import { resolveMemoryFlushPlan } from "../../plugins/memory-state.js";
 import { CommandLane } from "../../process/lanes.js";
 import { isIncognitoSessionKey, isUnscopedSessionKeySentinel } from "../../routing/session-key.js";
@@ -153,9 +153,28 @@ async function ensureMemoryFlushTargetFile(params: {
   ) {
     throw new Error("Memory flush target path must stay inside the workspace");
   }
-  await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
-  const handle = await fs.promises.open(targetPath, "a");
-  await handle.close();
+  const root = await fsRoot(workspaceRoot);
+  await root.append(targetRelativePath, "", { mkdir: true });
+}
+
+async function readMemoryFlushTargetFile(params: {
+  workspaceDir: string;
+  relativePath: string;
+}): Promise<string> {
+  const root = await fsRoot(params.workspaceDir);
+  try {
+    const existing = await root.read(params.relativePath, {
+      hardlinks: "reject",
+      nonBlockingRead: true,
+      symlinks: "reject",
+    });
+    return existing.buffer.toString("utf8");
+  } catch (error) {
+    if (error instanceof FsSafeError && error.code === "not-found") {
+      return "";
+    }
+    throw error;
+  }
 }
 
 const memoryDeps = {
@@ -163,6 +182,7 @@ const memoryDeps = {
   runEmbeddedAgentEntry,
   runEmbeddedAgent: runEmbeddedAgentDefault,
   ensureMemoryFlushTargetFile,
+  readMemoryFlushTargetFile,
   registerAgentRunContext,
   refreshQueuedFollowupSession,
   incrementCompactionCount,
@@ -179,6 +199,7 @@ function setAgentRunnerMemoryTestDeps(overrides?: Partial<typeof memoryDeps>): v
     compactEmbeddedAgentSession: compactEmbeddedAgentSessionDefault,
     runEmbeddedAgent: runEmbeddedAgentDefault,
     ensureMemoryFlushTargetFile,
+    readMemoryFlushTargetFile,
     registerAgentRunContext,
     refreshQueuedFollowupSession,
     incrementCompactionCount,
@@ -193,6 +214,8 @@ function setAgentRunnerMemoryTestDeps(overrides?: Partial<typeof memoryDeps>): v
 if (process.env.VITEST || process.env.NODE_ENV === "test") {
   (globalThis as Record<PropertyKey, unknown>)[Symbol.for("openclaw.agentRunnerMemoryTestApi")] = {
     setAgentRunnerMemoryTestDeps,
+    ensureMemoryFlushTargetFile,
+    readMemoryFlushTargetFile,
   };
 }
 
@@ -1285,17 +1308,18 @@ export async function runMemoryFlushIfNeeded(params: {
     workspaceDir: params.followupRun.run.workspaceDir,
     relativePath: memoryFlushWritePath,
   });
-  const memoryFlushAbsolutePath = path.join(
-    params.followupRun.run.workspaceDir,
-    memoryFlushWritePath,
-  );
   const readMemoryFlushContent = () =>
-    fs.promises.readFile(memoryFlushAbsolutePath, "utf8").catch((error: unknown) => {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-        return "";
-      }
-      throw error;
-    });
+    memoryDeps
+      .readMemoryFlushTargetFile({
+        workspaceDir: params.followupRun.run.workspaceDir,
+        relativePath: memoryFlushWritePath,
+      })
+      .catch((error: unknown) => {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+          return "";
+        }
+        throw error;
+      });
   // Capture one baseline before any write can start. Per-write snapshots can
   // pair a failed later write with an earlier success and miss mixed content.
   const memoryFlushContentBefore = await readMemoryFlushContent();
