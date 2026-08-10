@@ -169,13 +169,6 @@ export const AgentDefaultsSchema = z
             model: z.string().optional(),
             softThresholdTokens: z.number().int().nonnegative().optional(),
             forceFlushTranscriptBytes: NonNegativeByteSizeSchema.optional(),
-            dailyMemorySemanticPolicy: z
-              .object({
-                rejectHeadings: z.boolean().optional(),
-                deduplicateLines: z.boolean().optional(),
-              })
-              .strict()
-              .optional(),
           })
           .strict()
           .optional(),

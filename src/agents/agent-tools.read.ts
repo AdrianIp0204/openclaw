@@ -43,7 +43,7 @@ import {
   DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES,
   memoryFlushAppendRejected,
   prepareDailyMemoryFlushAppend,
-  type DailyMemoryFlushSemanticPolicy,
+  type MemoryFlushAppendBudget,
   type PreparedMemoryFlushAppend,
 } from "./memory-flush-append.js";
 import {
@@ -632,7 +632,7 @@ type MemoryFlushAppendOnlyWriteOptions = {
     root: string;
     bridge: SandboxFsBridge;
   };
-  semanticPolicy?: DailyMemoryFlushSemanticPolicy;
+  budget?: MemoryFlushAppendBudget;
 };
 
 async function readOptionalUtf8File(params: {
@@ -660,6 +660,7 @@ async function readOptionalUtf8File(params: {
         filePath: params.relativePath,
         cwd: params.sandbox.root,
         signal: params.signal,
+        maxBytes: DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES,
       });
       return buffer.toString("utf-8");
     }
@@ -672,6 +673,14 @@ async function readOptionalUtf8File(params: {
     });
     return existing.buffer.toString("utf-8");
   } catch (error) {
+    if (
+      (error instanceof FsSafeError && error.code === "too-large") ||
+      (error instanceof RangeError && error.message.includes("exceeds"))
+    ) {
+      throw memoryFlushAppendRejected(
+        `existing daily memory file exceeds ${DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES} bytes; compact it before appending more memory-flush content.`,
+      );
+    }
     if (
       (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT" ||
       (error instanceof FsSafeError && error.code === "not-found")
@@ -736,30 +745,18 @@ async function prepareMemoryFlushAppend(params: {
   root: string;
   relativePath: string;
   content: string;
-  semanticPolicy?: DailyMemoryFlushSemanticPolicy;
   sandbox?: MemoryFlushAppendOnlyWriteOptions["sandbox"];
   signal?: AbortSignal;
 }): Promise<PreparedMemoryFlushAppend> {
-  let existingContent: string;
-  try {
-    existingContent = await readOptionalUtf8File({
-      root: params.root,
-      relativePath: params.relativePath,
-      sandbox: params.sandbox,
-      signal: params.signal,
-    });
-  } catch (error) {
-    if (error instanceof FsSafeError && error.code === "too-large") {
-      throw memoryFlushAppendRejected(
-        `existing daily memory file exceeds ${DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES} bytes; compact it before appending more memory-flush content.`,
-      );
-    }
-    throw error;
-  }
+  const existingContent = await readOptionalUtf8File({
+    root: params.root,
+    relativePath: params.relativePath,
+    sandbox: params.sandbox,
+    signal: params.signal,
+  });
   return prepareDailyMemoryFlushAppend({
     content: params.content,
     existingContent,
-    semanticPolicy: params.semanticPolicy,
   });
 }
 
@@ -769,8 +766,7 @@ export function wrapToolMemoryFlushAppendOnlyWrite(
   options: MemoryFlushAppendOnlyWriteOptions,
 ): AnyAgentTool {
   const allowedAbsolutePath = path.resolve(options.root, options.relativePath);
-  let acceptedDailyAppendChars = 0;
-  let acceptedDailyAppendLines = 0;
+  const budget = options.budget ?? { acceptedChars: 0, acceptedLines: 0 };
   return {
     ...tool,
     description: `${tool.description} During memory flush, this tool may only append to ${options.relativePath}.`,
@@ -823,33 +819,17 @@ export function wrapToolMemoryFlushAppendOnlyWrite(
           root: options.root,
           relativePath: options.relativePath,
           content,
-          semanticPolicy: options.semanticPolicy,
           sandbox: options.sandbox,
           signal,
         });
         signal?.throwIfAborted();
-        if (preparedAppend.status === "skipped_duplicate") {
-          return {
-            content: [
-              {
-                type: "text" as const,
-                text: `No new memory-flush content appended to ${options.relativePath}; all proposed lines were already present.`,
-              },
-            ],
-            details: {
-              path: options.relativePath,
-              appendOnly: true,
-            },
-          };
-        }
-
-        const cumulativeLines = acceptedDailyAppendLines + preparedAppend.appendedLines;
+        const cumulativeLines = budget.acceptedLines + preparedAppend.appendedLines;
         if (cumulativeLines > DAILY_MEMORY_FLUSH_MAX_APPEND_LINES) {
           throw memoryFlushAppendRejected(
             `too many lines across this memory-flush run (${cumulativeLines}; max ${DAILY_MEMORY_FLUSH_MAX_APPEND_LINES}). Write 1-3 short pointer lines only.`,
           );
         }
-        const cumulativeChars = acceptedDailyAppendChars + preparedAppend.appendChars;
+        const cumulativeChars = budget.acceptedChars + preparedAppend.appendChars;
         if (cumulativeChars > DAILY_MEMORY_FLUSH_MAX_APPEND_CHARS) {
           throw memoryFlushAppendRejected(
             `content across this memory-flush run is too large (${cumulativeChars} chars; max ${DAILY_MEMORY_FLUSH_MAX_APPEND_CHARS}). Write 1-3 short pointer lines only.`,
@@ -864,8 +844,8 @@ export function wrapToolMemoryFlushAppendOnlyWrite(
           sandbox: options.sandbox,
           signal,
         });
-        acceptedDailyAppendLines = cumulativeLines;
-        acceptedDailyAppendChars = cumulativeChars;
+        budget.acceptedLines = cumulativeLines;
+        budget.acceptedChars = cumulativeChars;
         return {
           content: [
             { type: "text" as const, text: `Appended content to ${options.relativePath}.` },

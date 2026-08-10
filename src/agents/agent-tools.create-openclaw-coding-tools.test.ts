@@ -2266,34 +2266,73 @@ describe("createOpenClawCodingTools", () => {
     }
   });
 
-  it("applies configured daily-memory semantic policy to memory flush tools", async () => {
-    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-memory-policy-"));
+  it("shares the append budget across memory-flush fallback tool sets", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-memory-budget-"));
     const memoryRelativePath = "memory/2026-03-24.md";
+    const memoryFlushAppendBudget = { acceptedChars: 0, acceptedLines: 0 };
     try {
-      const tools = createOpenClawCodingTools({
-        workspaceDir,
-        trigger: "memory",
-        memoryFlushWritePath: memoryRelativePath,
-        config: {
-          agents: {
-            defaults: {
-              compaction: {
-                memoryFlush: {
-                  dailyMemorySemanticPolicy: { rejectHeadings: true },
-                },
-              },
-            },
-          },
-        },
+      const createAttemptWrite = () =>
+        requireToolExecute(
+          requireTool(
+            createOpenClawCodingTools({
+              workspaceDir,
+              trigger: "memory",
+              memoryFlushWritePath: memoryRelativePath,
+              memoryFlushAppendBudget,
+            }),
+            "write",
+          ),
+        );
+
+      await createAttemptWrite()("tool-memory-flush-primary", {
+        path: memoryRelativePath,
+        content: "x".repeat(500),
       });
-      const writeExecute = requireToolExecute(requireTool(tools, "write"));
       await expect(
-        writeExecute("tool-memory-flush-policy", {
+        createAttemptWrite()("tool-memory-flush-fallback", {
           path: memoryRelativePath,
-          content: "# Daily scaffold",
+          content: "y".repeat(301),
         }),
-      ).rejects.toThrow(/disabled by policy/);
-      await expect(fs.stat(path.join(workspaceDir, memoryRelativePath))).rejects.toThrow();
+      ).rejects.toThrow(/across this memory-flush run.*801.*max 800/);
+      await expect(fs.readFile(path.join(workspaceDir, memoryRelativePath), "utf8")).resolves.toBe(
+        "x".repeat(500),
+      );
+    } finally {
+      await fs.rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  it("passes the existing-file ceiling into sandbox memory-flush reads", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-memory-read-limit-"));
+    const memoryRelativePath = "memory/2026-03-24.md";
+    const bridge = createHostSandboxFsBridge(workspaceDir);
+    const readFile = vi.spyOn(bridge, "readFile");
+    try {
+      await fs.mkdir(path.join(workspaceDir, "memory"), { recursive: true });
+      await fs.writeFile(path.join(workspaceDir, memoryRelativePath), "seed", "utf8");
+      const sandbox = createAgentToolsSandboxContext({
+        workspaceDir,
+        containerWorkdir: workspaceDir,
+        fsBridge: bridge,
+      });
+      const write = requireToolExecute(
+        requireTool(
+          createOpenClawCodingTools({
+            workspaceDir,
+            sandbox,
+            trigger: "memory",
+            memoryFlushWritePath: memoryRelativePath,
+          }),
+          "write",
+        ),
+      );
+      await write("tool-memory-flush-sandbox-limit", {
+        path: memoryRelativePath,
+        content: "bounded note",
+      });
+      expect(readFile).toHaveBeenCalledWith(
+        expect.objectContaining({ maxBytes: 16 * 1024 * 1024 }),
+      );
     } finally {
       await fs.rm(workspaceDir, { recursive: true, force: true });
     }

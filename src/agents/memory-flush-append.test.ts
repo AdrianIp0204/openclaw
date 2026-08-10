@@ -9,7 +9,6 @@ describe("prepareDailyMemoryFlushAppend", () => {
       content,
       appendedLines: 2,
       appendChars: 800,
-      skippedDuplicateLines: 0,
     });
   });
 
@@ -31,83 +30,29 @@ describe("prepareDailyMemoryFlushAppend", () => {
       content: `${"x".repeat(400)}\n${"y".repeat(400)}`,
       error: /content too large/,
     },
-  ])("rejects $name regardless of semantic policy", ({ content, error }) => {
+  ])("rejects $name", ({ content, error }) => {
     expect(() =>
       prepareDailyMemoryFlushAppend({
         content,
         existingContent: "seed",
-        semanticPolicy: { deduplicateLines: false, rejectHeadings: false },
       }),
     ).toThrow(error);
   });
 
-  it("allows headings and exact duplicate lines by default", () => {
+  it("allows headings and exact duplicate lines", () => {
     const content = "# Memory - 2026-08-01\n- existing durable note";
     expect(
       prepareDailyMemoryFlushAppend({ content, existingContent: "- existing durable note" }),
-    ).toMatchObject({ status: "accepted", content, skippedDuplicateLines: 0 });
+    ).toMatchObject({ status: "accepted", content });
   });
 
-  it("preserves indentation in accepted Markdown", () => {
-    const content = "- parent note\n  - child note\n    code sample";
+  it("preserves all accepted payload bytes", () => {
+    const content = "  - first indented note\n\n- second note\n";
     expect(prepareDailyMemoryFlushAppend({ content, existingContent: "" })).toMatchObject({
       status: "accepted",
       content,
-      appendedLines: 3,
-    });
-  });
-
-  it.each([
-    "# Memory - 2026-08-01\n- compact note",
-    "Memory - 2026-08-01\n===================",
-    "Memory - 2026-08-01\n-------------------",
-  ])("rejects heading-shaped content only when configured: %s", (content) => {
-    expect(() =>
-      prepareDailyMemoryFlushAppend({
-        content,
-        existingContent: "seed",
-        semanticPolicy: { rejectHeadings: true },
-      }),
-    ).toThrow(/disabled by policy/);
-  });
-
-  it("deduplicates existing and repeated lines only when configured", () => {
-    expect(
-      prepareDailyMemoryFlushAppend({
-        content: "- existing durable note\n- new compact note\n  - new   compact note  ",
-        existingContent: "- existing durable note",
-        semanticPolicy: { deduplicateLines: true },
-      }),
-    ).toEqual({
-      status: "accepted",
-      content: "- new compact note",
-      appendedLines: 1,
-      appendChars: 18,
-      skippedDuplicateLines: 2,
-    });
-  });
-
-  it("does not let deduplication bypass structural input bounds", () => {
-    expect(() =>
-      prepareDailyMemoryFlushAppend({
-        content: "- same\n- same\n- same\n- same",
-        existingContent: "- same",
-        semanticPolicy: { deduplicateLines: true },
-      }),
-    ).toThrow(/too many lines/);
-  });
-
-  it("returns a duplicate-only skip when deduplication is configured", () => {
-    expect(
-      prepareDailyMemoryFlushAppend({
-        content: "  - existing   durable note  ",
-        existingContent: "- existing durable note",
-        semanticPolicy: { deduplicateLines: true },
-      }),
-    ).toEqual({
-      status: "skipped_duplicate",
-      content: "",
-      skippedDuplicateLines: 1,
+      appendedLines: 2,
+      appendChars: content.length,
     });
   });
 });
