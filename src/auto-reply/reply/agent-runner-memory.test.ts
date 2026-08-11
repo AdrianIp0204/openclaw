@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { testing as cliBackendsTesting } from "../../agents/cli-backends.test-support.js";
 import type { runEmbeddedAgentEntry } from "../../agents/embedded-agent-runner/run-entry.js";
 import type { EmbeddedAgentRunResult } from "../../agents/embedded-agent-runner/types.js";
+import { DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES } from "../../agents/memory-flush-append.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import {
   loadSessionEntry,
@@ -272,6 +273,20 @@ describe("runMemoryFlushIfNeeded", () => {
       await expect(fs.readFile(outsidePath, "utf8")).resolves.toBe("outside secret");
     },
   );
+
+  it("rejects an oversized daily file before the production memory-flush pre-read", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-memory-oversized-"));
+    const relativePath = "memory/2026-08-09.md";
+    const targetPath = path.join(workspaceDir, relativePath);
+    await fs.mkdir(path.dirname(targetPath), { recursive: true });
+    await fs.writeFile(targetPath, "");
+    await fs.truncate(targetPath, DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES + 1);
+
+    await expect(memoryFlushTargetTestApi.read({ workspaceDir, relativePath })).rejects.toThrow(
+      `Memory flush append rejected: existing daily memory file exceeds ${DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES} bytes`,
+    );
+  });
+
   let rootDir = "";
 
   beforeEach(async () => {
@@ -416,6 +431,45 @@ describe("runMemoryFlushIfNeeded", () => {
     setActivePluginRegistry(createEmptyPluginRegistry());
     clearMemoryPluginState();
     await fs.rm(rootDir, { recursive: true, force: true });
+  });
+
+  it("rejects an oversized pre-flush target before starting the maintenance agent", async () => {
+    const relativePath = "memory/2023-11-14.md";
+    const targetPath = path.join(rootDir, relativePath);
+    await fs.mkdir(path.dirname(targetPath), { recursive: true });
+    await fs.writeFile(targetPath, "");
+    await fs.truncate(targetPath, DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES + 1);
+    setAgentRunnerMemoryTestDeps({
+      readMemoryFlushTargetFile: memoryFlushTargetTestApi.read,
+    });
+    const sessionEntry: SessionEntry = {
+      sessionId: "session",
+      updatedAt: Date.now(),
+      totalTokens: 80_000,
+      totalTokensFresh: true,
+      totalTokensVersion: 1,
+      compactionCount: 1,
+    };
+
+    await expect(
+      runMemoryFlushIfNeeded({
+        cfg: { agents: { defaults: { compaction: { memoryFlush: {} } } } },
+        followupRun: createTestFollowupRun({ workspaceDir: rootDir }),
+        sessionCtx: { Provider: "whatsapp" } as unknown as TemplateContext,
+        defaultModel: "anthropic/claude-opus-4-6",
+        agentCfgContextTokens: 100_000,
+        resolvedVerboseLevel: "off",
+        sessionEntry,
+        sessionStore: { main: sessionEntry },
+        sessionKey: "main",
+        isHeartbeat: false,
+        replyOperation: createReplyOperation(),
+      }),
+    ).rejects.toThrow(
+      `Memory flush append rejected: existing daily memory file exceeds ${DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES} bytes`,
+    );
+    expect(runEmbeddedAgentEntryMock).not.toHaveBeenCalled();
+    expect(runEmbeddedAgentMock).not.toHaveBeenCalled();
   });
 
   it("runs a memory flush turn, rotates after compaction, and persists metadata", async () => {

@@ -12,6 +12,10 @@ import { resolveCliBackendConfig } from "../../agents/cli-backends.js";
 import { estimateMessagesTokens } from "../../agents/compaction.js";
 import { isBenignCompactionSkipResult } from "../../agents/embedded-agent-runner/compact-reasons.js";
 import { runEmbeddedAgentEntry } from "../../agents/embedded-agent-runner/run-entry.js";
+import {
+  DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES,
+  memoryFlushAppendRejected,
+} from "../../agents/memory-flush-append.js";
 import { isCliRuntimeAliasForProvider } from "../../agents/model-runtime-aliases.js";
 import { isCliProvider } from "../../agents/model-selection.js";
 import { resolveContextConfigProviderForRuntime } from "../../agents/openai-routing.js";
@@ -165,6 +169,7 @@ async function readMemoryFlushTargetFile(params: {
   try {
     const existing = await root.read(params.relativePath, {
       hardlinks: "reject",
+      maxBytes: DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES,
       nonBlockingRead: true,
       symlinks: "reject",
     });
@@ -172,6 +177,11 @@ async function readMemoryFlushTargetFile(params: {
   } catch (error) {
     if (error instanceof FsSafeError && error.code === "not-found") {
       return "";
+    }
+    if (error instanceof FsSafeError && error.code === "too-large") {
+      throw memoryFlushAppendRejected(
+        `existing daily memory file exceeds ${DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES} bytes; compact it before appending more memory-flush content.`,
+      );
     }
     throw error;
   }
