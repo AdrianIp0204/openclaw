@@ -1,3 +1,4 @@
+import "./host-capability.test-mocks.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,7 +8,6 @@ import { createDeferred } from "../../../test/helpers/promise.js";
 import type { GatewayRequestContext } from "../../gateway/server-methods/types.js";
 import { onAgentEvent } from "../../infra/agent-events.js";
 import {
-  resetAgentRunRegistryForTest,
   rotateAgentRunRegistryLifecycleGeneration,
   validateAgentRunDelegatedAuthority,
 } from "../../infra/agent-run-registry.js";
@@ -19,9 +19,7 @@ import {
 import { AsyncWorkScope } from "../../shared/async-work-scope.js";
 import {
   closeAdmittedRunDelegatedAuthority,
-  createOperationalRunInstanceRef,
   getAdmittedRunDelegatedAuthority,
-  prepareAgentRunAdmission,
   type PreparedAgentRunAdmission,
 } from "../admitted-run-context.js";
 import { runAgentToolSourceExecutionGuard } from "../agent-tool-source-execution-guard.js";
@@ -29,7 +27,6 @@ import {
   rewrapToolWithBeforeToolCallHook,
   runBeforeToolCallHook,
 } from "../agent-tools.before-tool-call.js";
-import { initializeMemoryFlushAppendBudget } from "../embedded-agent-runner/run/memory-flush-budget.js";
 import { createAgentRunRestartAbortError } from "../run-termination.js";
 import {
   attachInternalToolExecutionPreparer,
@@ -40,20 +37,16 @@ import type { AnyAgentTool } from "../tools/common.js";
 import { getGatewayToolCallerIdentity } from "../tools/gateway-caller-context.js";
 import { callGatewayTool } from "../tools/gateway.js";
 import { getInProcessGatewayToolContext } from "../tools/in-process-gateway.js";
+import {
+  useAdmittedHarnessAttempt,
+  type HostAttempt,
+} from "./host-capability.admission.test-support.js";
 import { createAgentHarnessHostCapabilities } from "./host-capability.js";
 import { retainBeforeToolCallForNativeHookRelay } from "./host-private-capabilities.js";
-
-vi.mock("../agent-tools.before-tool-call.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../agent-tools.before-tool-call.js")>()),
-  rewrapToolWithBeforeToolCallHook: vi.fn((tool) => tool),
-  runBeforeToolCallHook: vi.fn(async ({ params }) => ({ blocked: false, params })),
-}));
-vi.mock("../tools/gateway.js", () => ({ callGatewayTool: vi.fn() }));
 
 const mockRewrap = vi.mocked(rewrapToolWithBeforeToolCallHook);
 const mockRunBefore = vi.mocked(runBeforeToolCallHook);
 const mockCallGatewayTool = vi.mocked(callGatewayTool);
-type HostAttempt = Parameters<typeof createAgentHarnessHostCapabilities>[0]["attempt"];
 
 type HostRevocationContext = {
   host: ReturnType<typeof createAgentHarnessHostCapabilities>;
@@ -82,39 +75,7 @@ const policyRevocations = [
   },
 ];
 
-const admissions: PreparedAgentRunAdmission[] = [];
-
-async function admittedAttempt(
-  runId = "run-1",
-  overrides: Omit<Partial<HostAttempt>, "admittedRunContext" | "runId"> = {},
-): Promise<{ attempt: HostAttempt; admission: PreparedAgentRunAdmission }> {
-  const admission = prepareAgentRunAdmission({
-    cfg: {},
-    facts: {
-      runId,
-      agentId: "main",
-      ingress: { kind: "system", boundary: "host-capability-test", state: "present" },
-    },
-    operationalRunInstance: createOperationalRunInstanceRef(runId),
-  });
-  admissions.push(admission);
-  const admittedRunContext = await admission.admit("plugin-harness", `harness-${runId}`);
-  return {
-    admission,
-    attempt: {
-      agentId: "main",
-      sessionId: "session-1",
-      sessionKey: "agent:main:session-1",
-      runId,
-      cwd: "/attempt/worktree",
-      workspaceDir: "/workspace",
-      currentChannelId: "chat-1",
-      messageChannel: "telegram",
-      ...overrides,
-      admittedRunContext,
-    },
-  };
-}
+const admittedAttempt = useAdmittedHarnessAttempt();
 
 function testTool(execute = vi.fn(async () => ({ content: [], details: {} }))): {
   tool: AnyAgentTool;
@@ -149,10 +110,6 @@ function bindTool(
 
 afterEach(() => {
   vi.unstubAllEnvs();
-  for (const admission of admissions.splice(0)) {
-    admission.close();
-  }
-  resetAgentRunRegistryForTest();
 });
 
 describe("agent harness host capability", () => {
@@ -273,54 +230,6 @@ describe("agent harness host capability", () => {
       }
     },
   );
-
-  it("shares host-owned memory-flush accounting across external harness tool surfaces", async () => {
-    const workspaceDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-host-memory-flush-"));
-    const relativePath = "memory/2026-03-24.md";
-    try {
-      const { attempt } = await admittedAttempt("run-memory-flush", {
-        cwd: workspaceDir,
-        workspaceDir,
-        trigger: "memory",
-        memoryFlushWritePath: relativePath,
-      });
-      initializeMemoryFlushAppendBudget(attempt.admittedRunContext.operationalRunInstance);
-      const createWrite = (pluginId: string) => {
-        const host = createAgentHarnessHostCapabilities({ attempt, pluginId });
-        const options = { workspaceDir, trigger: "memory", memoryFlushWritePath: relativePath };
-        Object.assign(options, {
-          memoryFlushAppendBudget: { acceptedChars: -10_000, acceptedLines: -10_000 },
-        });
-        const write = host.capabilities
-          .createToolSurface?.(options)
-          .find((tool) => tool.name === "write");
-        if (!write) {
-          throw new Error(`expected ${pluginId} host-created write tool`);
-        }
-        return write.execute;
-      };
-
-      await createWrite("codex")("primary", {
-        path: relativePath,
-        content: "x".repeat(500),
-      });
-      await expect(
-        createWrite("copilot")("fallback", {
-          path: relativePath,
-          content: "y".repeat(301),
-        }),
-      ).rejects.toThrow(/across this memory-flush run.*801.*max 800/);
-      await expect(
-        createWrite("third-party-harness")("third-party", {
-          path: relativePath,
-          content: "z".repeat(301),
-        }),
-      ).rejects.toThrow(/across this memory-flush run.*801.*max 800/);
-      expect(fs.readFileSync(path.join(workspaceDir, relativePath), "utf8")).toBe("x".repeat(500));
-    } finally {
-      fs.rmSync(workspaceDir, { recursive: true, force: true });
-    }
-  });
 
   it("overwrites plugin policy fields with the host snapshot and revokes lexically", async () => {
     const { attempt, admission } = await admittedAttempt();

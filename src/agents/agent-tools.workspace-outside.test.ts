@@ -6,11 +6,8 @@ import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import "./test-helpers/fast-coding-tools.js";
 import "./test-helpers/fast-openclaw-tools.js";
 import { createOpenClawCodingTools } from "./agent-tools.js";
-import {
-  createHostWorkspaceWriteTool,
-  createOpenClawReadTool,
-  wrapToolMemoryFlushAppendOnlyWrite,
-} from "./agent-tools.read.js";
+import { wrapToolMemoryFlushAppendOnlyWrite } from "./agent-tools.memory-flush-write.js";
+import { createHostWorkspaceWriteTool, createOpenClawReadTool } from "./agent-tools.read.js";
 import { expectReadWriteEditTools, getTextContent } from "./test-helpers/agent-tools-fs-helpers.js";
 import type { AnyAgentTool } from "./tools/common.js";
 

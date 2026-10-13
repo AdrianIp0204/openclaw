@@ -30,6 +30,19 @@ import {
   QA_COMPACTION_RETRY_FINAL_MARKER,
 } from "./mock-openai-assistant-text.js";
 import {
+  QA_COMPACTION_RETRY_PROMPT_RE,
+  QA_COMPACTION_RETRY_OVERFLOW_THRESHOLD_BYTES,
+  QA_COMPACTION_OUTPUT_RECOVERY_OVERFLOW_THRESHOLD_BYTES,
+  QA_COMPACTION_RETRY_DURABLE_MARKER,
+  QA_COMPACTION_RETRY_BULKY_MARKER,
+  QA_COMPACTION_RETRY_HISTORICAL_PHRASE,
+  QA_COMPACTION_RETRY_SUMMARY,
+  QA_COMPACTION_RETRY_HISTORICAL_SUMMARY,
+  resolveCompactionRecoverySummary,
+  hasCompactionOutputRecoveryMarker,
+  resolveCompactionSummaryFaultMode,
+} from "./mock-openai-compaction.js";
+import {
   type ResponsesInputItem,
   type StreamEvent,
   type MockOpenAiRequestSnapshot,
@@ -59,7 +72,6 @@ import {
   QA_TOOL_PROGRESS_PROMPT_RE,
   QA_TOOL_LOOP_GLOBAL_BREAKER_PROMPT_RE,
   QA_PROVIDER_HTTP_503_AFTER_TOOL_PROMPT_RE,
-  QA_MEMORY_FLUSH_CUMULATIVE_FALLBACK_MARKER_RE,
   QA_GROUP_VISIBLE_REPLY_TOOL_PROMPT_RE,
   QA_MSTEAMS_THREAD_DEDUPE_PROMPT_RE,
   QA_THREAD_REPLY_RECEIPT_PROMPT_RE,
@@ -177,6 +189,10 @@ import {
   extractCurrentImageRequest,
   parseToolOutputJson,
 } from "./mock-openai-input.js";
+import {
+  buildMemoryFlushCumulativeFallbackEvents,
+  resolveMemoryFlushCumulativeFallbackFailure,
+} from "./mock-openai-memory-flush.js";
 import { attachQaMockResponsesWebSocketServer } from "./mock-openai-responses-websocket.js";
 import {
   buildSlackOwnedRequesterEvents,
@@ -231,114 +247,6 @@ const MOCK_HTTP_POST_ROUTES = new Map([
   ["/v1/responses", "OpenAI Responses"],
   ["/v1/messages", "Anthropic Messages"],
 ]);
-const QA_COMPACTION_RETRY_PROMPT_RE = /compaction retry mutating tool check/i;
-const QA_COMPACTION_RETRY_OVERFLOW_THRESHOLD_BYTES = 256 * 1024;
-const QA_COMPACTION_OUTPUT_RECOVERY_OVERFLOW_THRESHOLD_BYTES = 96 * 1024;
-const QA_COMPACTION_RETRY_DURABLE_MARKER = "QA-COMPACTION-DURABLE-MARKER";
-const QA_COMPACTION_RETRY_BULKY_MARKER = "QA-COMPACTION-BULKY-HISTORICAL-MARKER";
-const QA_COMPACTION_RETRY_HISTORICAL_PHRASE = "post-marker historical user block";
-const QA_COMPACTION_EMPTY_OUTPUT_ONCE_MARKER_RE =
-  /\bQA-COMPACTION-EMPTY-OUTPUT-ONCE-[A-Za-z0-9_-]+\b/u;
-const QA_COMPACTION_REASONING_ONLY_OUTPUT_ONCE_MARKER_RE =
-  /\bQA-COMPACTION-REASONING-ONLY-OUTPUT-ONCE-[A-Za-z0-9_-]+\b/u;
-const QA_COMPACTION_EMPTY_RECOVERY_SUMMARY_MARKER = "QA-COMPACTION-EMPTY-RECOVERED-SUMMARY";
-const QA_COMPACTION_REASONING_RECOVERY_SUMMARY_MARKER = "QA-COMPACTION-REASONING-RECOVERED-SUMMARY";
-const QA_MEMORY_FLUSH_CUMULATIVE_FALLBACK_PROMPT_RE = /Pre-compaction memory flush\./u;
-const QA_MEMORY_FLUSH_DAILY_PATH_RE = /\bmemory\/\d{4}-\d{2}-\d{2}\.md\b/u;
-const QA_MEMORY_FLUSH_PRIMARY_MODEL = "gpt-5.6-luna";
-const QA_MEMORY_FLUSH_FALLBACK_MODEL = "gpt-5.6-luna-alt";
-
-function isMemoryFlushCumulativeFallbackRequest(params: { allInputText: string; prompt: string }) {
-  return (
-    QA_MEMORY_FLUSH_CUMULATIVE_FALLBACK_MARKER_RE.test(params.allInputText) &&
-    QA_MEMORY_FLUSH_CUMULATIVE_FALLBACK_PROMPT_RE.test(params.prompt)
-  );
-}
-
-function isAcceptedMemoryFlushAppendResult(toolOutput: string) {
-  return /^Appended content to memory\/\d{4}-\d{2}-\d{2}\.md\.$/u.test(toolOutput.trim());
-}
-const QA_COMPACTION_RETRY_SUMMARY = `## Decisions
-- Continue the compaction retry from durable context without replaying a completed mutation.
-
-## Open TODOs
-- Write compaction-retry-summary.txt exactly once.
-- Return the final replay-safety marker.
-
-## Constraints/Rules
-- Preserve ${QA_COMPACTION_RETRY_DURABLE_MARKER}.
-- Write exactly: Replay safety: unsafe after write.
-
-## Pending user asks
-- Create compaction-retry-summary.txt, then reply exactly: Protocol note: replay unsafe after write.
-
-## Exact identifiers
-- ${QA_COMPACTION_RETRY_DURABLE_MARKER}
-- compaction-retry-summary.txt`;
-const QA_COMPACTION_RETRY_HISTORICAL_SUMMARY = `## Decisions
-- Preserve the latest ${QA_COMPACTION_RETRY_HISTORICAL_PHRASE} context through staged compaction.
-
-## Open TODOs
-- Continue summarizing the ${QA_COMPACTION_RETRY_HISTORICAL_PHRASE} sequence.
-
-## Constraints/Rules
-- Keep historical content distinct from live task state.
-- Do not invent durable context absent from the summarized history.
-
-## Pending user asks
-- Retain the ${QA_COMPACTION_RETRY_HISTORICAL_PHRASE} details.
-
-## Exact identifiers
-- None captured.`;
-const QA_GENERIC_COMPACTION_SUMMARY = `## Decisions
-- Continue from the summary without restarting completed work.
-
-## Open TODOs
-- Continue the active task.
-
-## Constraints/Rules
-- Keep current requirements and identifiers.
-
-## Pending user asks
-- Continue the active task from the retained context.
-
-## Exact identifiers
-- None captured.`;
-const QA_COMPACTION_OUTPUT_RECOVERY_SUMMARY = `## Decisions
-- Retry the typed compaction-summary fault at the compaction owner.
-
-## Open TODOs
-- Continue the active task after compaction.
-
-## Constraints/Rules
-- Preserve the historical recovery user block and current continuation.
-
-## Pending user asks
-- Retain the historical recovery user block context.
-
-## Exact identifiers`;
-
-function resolveCompactionRecoverySummary(allInputText: string) {
-  const faultMarker =
-    QA_COMPACTION_EMPTY_OUTPUT_ONCE_MARKER_RE.exec(allInputText)?.[0] ??
-    QA_COMPACTION_REASONING_ONLY_OUTPUT_ONCE_MARKER_RE.exec(allInputText)?.[0];
-  const recoveryMarker = faultMarker?.startsWith("QA-COMPACTION-EMPTY-")
-    ? QA_COMPACTION_EMPTY_RECOVERY_SUMMARY_MARKER
-    : faultMarker
-      ? QA_COMPACTION_REASONING_RECOVERY_SUMMARY_MARKER
-      : undefined;
-  return recoveryMarker && faultMarker
-    ? `${QA_COMPACTION_OUTPUT_RECOVERY_SUMMARY}\n- ${recoveryMarker}\n- ${faultMarker}`
-    : QA_GENERIC_COMPACTION_SUMMARY;
-}
-
-function hasCompactionOutputRecoveryMarker(allInputText: string) {
-  return (
-    QA_COMPACTION_EMPTY_OUTPUT_ONCE_MARKER_RE.test(allInputText) ||
-    QA_COMPACTION_REASONING_ONLY_OUTPUT_ONCE_MARKER_RE.test(allInputText)
-  );
-}
-
 const QA_RESTART_CHECKPOINT_COUNT = 3;
 const QA_RESTART_FINAL_TEXT = "unsafeVisible=false\nRESTART-CODE-MODE-WAIT-OK";
 const QA_FAILED_TOOL_TERMINAL_RECOVERY_PROMPT_RE = /failed tool terminal recovery qa check/i;
@@ -360,36 +268,6 @@ function normalizeResponsesInput(value: unknown): ResponsesInputItem[] {
     return [{ role: "user", content: [{ type: "input_text", text: value }] }];
   }
   return [];
-}
-
-function resolveCompactionSummaryFaultMode(params: {
-  allInputText: string;
-  requestKind: MockOpenAiRequestKind;
-  servedFaultMarkers: Set<string>;
-}): MockCompactionSummaryFaultMode {
-  if (params.requestKind !== "compaction-summary") {
-    return "none";
-  }
-  const emptyMarker = QA_COMPACTION_EMPTY_OUTPUT_ONCE_MARKER_RE.exec(params.allInputText)?.[0];
-  const reasoningMarker = QA_COMPACTION_REASONING_ONLY_OUTPUT_ONCE_MARKER_RE.exec(
-    params.allInputText,
-  )?.[0];
-  const selected = emptyMarker
-    ? {
-        key: emptyMarker,
-        mode: "empty-output-once" as const,
-      }
-    : reasoningMarker
-      ? {
-          key: reasoningMarker,
-          mode: "reasoning-only-output-once" as const,
-        }
-      : undefined;
-  if (!selected?.key || params.servedFaultMarkers.has(selected.key)) {
-    return "none";
-  }
-  params.servedFaultMarkers.add(selected.key);
-  return selected.mode;
 }
 
 function buildMemoryGetArgs(result: Record<string, unknown>) {
@@ -560,26 +438,15 @@ async function buildResponsesPayload(
           : resolveCompactionRecoverySummary(allInputText),
     );
   }
-  if (isMemoryFlushCumulativeFallbackRequest({ allInputText, prompt })) {
-    if (hasCompletedToolOutput) {
-      return buildAssistantEvents("NO_REPLY");
-    }
-    const dailyPath = allInputText.match(QA_MEMORY_FLUSH_DAILY_PATH_RE)?.[0];
-    if (!dailyPath) {
-      throw new Error("memory-flush cumulative fallback fixture missing canonical daily path");
-    }
-    if (model === QA_MEMORY_FLUSH_PRIMARY_MODEL) {
-      return buildToolCallEventsWithArgs("write", {
-        path: dailyPath,
-        content: "P".repeat(500),
-      });
-    }
-    if (model === QA_MEMORY_FLUSH_FALLBACK_MODEL) {
-      return buildToolCallEventsWithArgs("write", {
-        path: dailyPath,
-        content: "F".repeat(301),
-      });
-    }
+  const memoryFlushEvents = buildMemoryFlushCumulativeFallbackEvents({
+    allInputText,
+    prompt,
+    model,
+    hasCompletedToolOutput,
+    toolDeclarationBody,
+  });
+  if (memoryFlushEvents) {
+    return memoryFlushEvents;
   }
   if (
     QA_COMPACTION_RETRY_PROMPT_RE.test(allInputText) ||
@@ -2217,28 +2084,10 @@ export async function startQaMockOpenAiServer(params?: QaMockOpenAiServerOptions
             sessionId,
           }
         : undefined;
-    const shouldFailAcceptedMemoryFlushAppend =
-      model === QA_MEMORY_FLUSH_PRIMARY_MODEL &&
-      isMemoryFlushCumulativeFallbackRequest({ allInputText, prompt }) &&
-      isAcceptedMemoryFlushAppendResult(requestSnapshotBase.toolOutput);
-    const memoryFlushPrimaryFailure = shouldFailAcceptedMemoryFlushAppend
-      ? scenarioState.memoryFlushPrimary503Served
-        ? {
-            status: 400,
-            type: "server_error",
-            message: "Injected terminal server error",
-          }
-        : {
-            status: 503,
-            type: "server_error",
-            message: "Service Unavailable",
-          }
-      : undefined;
-    if (shouldFailAcceptedMemoryFlushAppend) {
-      // Codex retries 5xx responses internally. The first response records the requested
-      // 503, then a non-retryable response exposes the server error to OpenClaw's fallback.
-      scenarioState.memoryFlushPrimary503Served = true;
-    }
+    const memoryFlushPrimaryFailure = resolveMemoryFlushCumulativeFallbackFailure(
+      requestSnapshotBase,
+      scenarioState,
+    );
     const shouldFailAfterTool =
       QA_PROVIDER_HTTP_503_AFTER_TOOL_PROMPT_RE.test(allInputText) && hasToolOutput(input);
     const failure =

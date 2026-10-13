@@ -110,10 +110,8 @@ const EMPTY_EMBEDDED_AGENT_CONFIG: OpenClawConfig = Object.freeze({});
 export function runEmbeddedAgent(
   paramsInput: RunEmbeddedAgentInternalParams,
 ): Promise<EmbeddedAgentRunResult> {
-  const {
-    memoryFlushAppendBudget: _callerSuppliedMemoryFlushAppendBudget,
-    ...internalParamsInput
-  } = paramsInput as RunEmbeddedAgentInternalParams & { memoryFlushAppendBudget?: unknown };
+  const internalParamsInput = { ...paramsInput };
+  Reflect.deleteProperty(internalParamsInput, "memoryFlushAppendBudget");
   const config = resolveEmbeddedRunConfig(internalParamsInput);
   const lifecycleGeneration =
     internalParamsInput.lifecycleGeneration ??

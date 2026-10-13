@@ -31,12 +31,13 @@ scenario:
     - docs/reference/session-management-compaction.md
   codeRefs:
     - src/auto-reply/reply/agent-runner-memory.ts
-    - src/agents/agent-tools.read.ts
+    - src/agents/agent-tools.memory-flush-write.ts
     - src/agents/embedded-agent-runner/run-entry.ts
     - src/agents/embedded-agent-runner/run/memory-flush-budget.ts
     - src/agents/model-fallback-runner.ts
     - extensions/codex/src/app-server/dynamic-tool-build.ts
     - extensions/qa-lab/src/providers/mock-openai/server.ts
+    - extensions/qa-lab/src/providers/mock-openai/mock-openai-memory-flush.ts
   execution:
     kind: flow
     runtime: codex

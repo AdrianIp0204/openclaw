@@ -4,11 +4,8 @@ import path from "node:path";
 import { __setFsSafeTestHooksForTest } from "@openclaw/fs-safe/test-hooks";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
-import {
-  createHostWorkspaceEditTool,
-  createHostWorkspaceWriteTool,
-  wrapToolMemoryFlushAppendOnlyWrite,
-} from "./agent-tools.read.js";
+import { wrapToolMemoryFlushAppendOnlyWrite } from "./agent-tools.memory-flush-write.js";
+import { createHostWorkspaceEditTool, createHostWorkspaceWriteTool } from "./agent-tools.read.js";
 import { withGatewayToolCallerIdentity } from "./tools/gateway-caller-context.js";
 
 describe("workspace mutation authority", () => {

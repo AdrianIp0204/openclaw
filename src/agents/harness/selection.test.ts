@@ -93,6 +93,7 @@ import {
   selectAgentHarness,
   selectAgentHarnessForPreparedModelProviders,
 } from "./selection.js";
+import { privateHarnessParamCases } from "./selection.private-params.test-support.js";
 import {
   createHarnessAttemptParams,
   createHarnessCompactionFixture,
@@ -130,21 +131,6 @@ const contextEngineTurnAttemptMocks = vi.hoisted(() => ({
   drainPendingContextEngineTurnsBeforeRun: vi.fn(async (_params: unknown) => {}),
 }));
 const builtInHarnesses = vi.hoisted(() => new WeakSet<object>());
-const privateHarnessParamCases = [
-  {
-    field: "runtimePluginToolGrant",
-    value: { pluginId: "grant-owner", toolNames: ["optional_tool"] },
-  },
-  { field: "__openclawSourceReplyDeliveryRuntime", value: { currentMode: "automatic" } },
-  {
-    field: "memoryFlushAppendBudget",
-    value: { acceptedChars: -10_000, acceptedLines: -10_000 },
-  },
-  { field: "compactionCountOwner", value: "caller" },
-  { field: "onContextAccountingEvent", value: () => undefined },
-  { field: "onCompactionRequestBudget", value: () => undefined },
-] as const;
-
 function createTranscriptRecorder(
   admission: ReturnType<typeof createTranscriptAnchor> & {
     logicalTurnId: string;

@@ -5,7 +5,7 @@ import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { validateJsonSchemaValue } from "../plugins/schema-validator.js";
 import type { JsonSchemaObject } from "../shared/json-schema.types.js";
-import { wrapToolMemoryFlushAppendOnlyWrite } from "./agent-tools.read.js";
+import { wrapToolMemoryFlushAppendOnlyWrite } from "./agent-tools.memory-flush-write.js";
 import type { AnyAgentTool } from "./agent-tools.types.js";
 import { DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES } from "./memory-flush-append.js";
 import { createWriteTool } from "./sessions/tools/index.js";
@@ -101,6 +101,45 @@ describe("wrapToolMemoryFlushAppendOnlyWrite output contract", () => {
     expect(reachedCommit).toBe(true);
     expect(await fs.readFile(absolute, "utf8")).toBe("seed\n");
   });
+
+  it.runIf(process.platform !== "win32").each([RELATIVE_PATH, "MEMORY.md"])(
+    "keeps post-read symlink rejection scoped to daily memory (%s)",
+    async (relativePath) => {
+      const absolutePath = path.join(root, relativePath);
+      const originalPath = path.join(root, "original.md");
+      const redirectedPath = path.join(root, "redirected.md");
+      await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+      await fs.writeFile(absolutePath, "seed\n");
+      await fs.writeFile(redirectedPath, "redirected\n");
+      const write = vi.fn(async ({ commit }: { commit: () => Promise<void> }) => {
+        // Retarget after the wrapper's read and lock admission, before the
+        // filesystem owner reaches its actual append mutation boundary.
+        await fs.rename(absolutePath, originalPath);
+        await fs.symlink(redirectedPath, absolutePath, "file");
+        await commit();
+      });
+      const wrapped = wrapToolMemoryFlushAppendOnlyWrite(baseWriteTool(), {
+        root,
+        relativePath,
+        memoryWriteProvenance: {
+          classifies: async () => true,
+          write,
+          clearAfterDelete: async () => {},
+        },
+      });
+
+      const pending = wrapped.execute("retargeted-append", { path: relativePath, content: "note" });
+      if (relativePath === RELATIVE_PATH) {
+        await expect(pending).rejects.toMatchObject({ code: "symlink" });
+        await expect(fs.readFile(redirectedPath, "utf8")).resolves.toBe("redirected\n");
+      } else {
+        await expect(pending).resolves.toMatchObject({ details: { changed: true } });
+        await expect(fs.readFile(redirectedPath, "utf8")).resolves.toBe("redirected\nnote");
+      }
+      expect(write).toHaveBeenCalledOnce();
+      await expect(fs.readFile(originalPath, "utf8")).resolves.toBe("seed\n");
+    },
+  );
 
   it("returns write-schema-conforming details when creating the memory file", async () => {
     const details = await runAppend();

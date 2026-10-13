@@ -88,6 +88,7 @@ export async function ensureMemoryFlushTargetFile(params: {
     const root = await fsRoot(workspaceRoot);
     await root.append(targetRelativePath, "", {
       mkdir: true,
+      mutationSymlinks: "reject",
       assertBeforeMutation: params.assertCurrent,
     });
     params.assertCurrent();

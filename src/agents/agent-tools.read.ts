@@ -1,22 +1,17 @@
 // Read/write/edit tool wrappers for host and sandbox workspaces.
-// Adds workspace-root guards, adaptive read paging, image validation, memory
-// append-only writes, and parameter cleanup around the session file tools.
+// Adds workspace-root guards, adaptive read paging, image validation, and
+// parameter cleanup around the session file tools.
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { URL } from "node:url";
-import { hasEncodedFileUrlSeparator, trySafeFileURLToPath } from "@openclaw/fs-safe/advanced";
-import { isWindowsDrivePath } from "@openclaw/fs-safe/archive";
 import { detectMime } from "@openclaw/media-core/mime";
 import type { Static, TSchema } from "typebox";
 import { Value } from "typebox/value";
 import { resolveRootPath } from "../infra/boundary-path.js";
 import { toErrorObject } from "../infra/errors.js";
-import { withFileLock } from "../infra/file-lock.js";
 import {
   canonicalPathFromExistingAncestor,
   findExistingAncestor,
-  resolveAbsolutePathForWrite,
   root as fsRoot,
   FsSafeError,
 } from "../infra/fs-safe.js";
@@ -28,10 +23,12 @@ import {
   resolveMediaReferenceSandboxPath,
 } from "../media/media-reference.js";
 import { sniffMimeFromBase64 } from "../media/sniff-mime-from-base64.js";
-import { KeyedAsyncQueue } from "../plugin-sdk/keyed-async-queue.js";
 import { clampNumber } from "../utils.js";
-import type { OperationalRunInstanceRef } from "./admitted-run-context.js";
 import { captureAgentToolSourceExecutionGuard } from "./agent-tool-source-execution-guard.js";
+import {
+  mapContainerPathToWorkspaceRoot,
+  resolveContainerPathCandidate,
+} from "./agent-tools.file-path.js";
 import {
   REQUIRED_PARAM_GROUPS,
   assertRequiredParams,
@@ -42,25 +39,15 @@ import {
 } from "./agent-tools.params.js";
 import type { AnyAgentTool } from "./agent-tools.types.js";
 import { collectTextContentBlocks } from "./content-blocks.js";
-import {
-  createMemoryFlushAppendEnforcement,
-  resolveMemoryFlushAppendEnforcement,
-} from "./embedded-agent-runner/run/memory-flush-budget.js";
 import { writeHostFile } from "./host-file-write.js";
 import type { ImageSanitizationLimits } from "./image-sanitization.js";
-import {
-  DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES,
-  isDailyMemoryPath,
-  memoryFlushAppendRejected,
-  prepareDailyMemoryFlushAppend,
-} from "./memory-flush-append.js";
 import {
   type MemoryWriteProvenanceObserver,
   withMemoryWriteProvenance,
 } from "./memory-write-provenance.js";
 import { resolveSandboxPathMapping, toRelativeWorkspacePath } from "./path-policy.js";
 import type { AgentTool, AgentToolResult } from "./runtime/index.js";
-import { assertSandboxPath, normalizeFileReferencePrefix } from "./sandbox-paths.js";
+import { assertSandboxPath } from "./sandbox-paths.js";
 import { resolveSandboxFileMutationQueueKey } from "./sandbox/file-mutation-identity.js";
 import type { SandboxFsBridge } from "./sandbox/fs-bridge.js";
 import {
@@ -150,13 +137,6 @@ type ReadTruncationDetails = {
 
 const READ_CONTINUATION_NOTICE_RE =
   /\n\n\[(?:Showing (?:lines|part of line) [^\]]*|Read output capped [^\]]*|\d+ more lines? in file\. [^\]]*)\]\s*$/;
-const DAILY_MEMORY_FLUSH_LOCK_OPTIONS = {
-  retries: { retries: 10, factor: 1, minTimeout: 10, maxTimeout: 100, randomize: true },
-  stale: 30_000,
-};
-
-const dailyMemoryFlushProcessLocks = new KeyedAsyncQueue();
-
 export function resolveAdaptiveReadMaxBytes(options?: OpenClawReadToolOptions): number {
   const contextWindowTokens = options?.modelContextWindowTokens;
   if (
@@ -591,326 +571,6 @@ function normalizeReadResultDetails(
     };
   }
   return { ...result, details: { kind: "text", content: text } };
-}
-
-function resolveContainerPathCandidate(filePath: string): string | null {
-  let candidate = normalizeFileReferencePrefix(filePath);
-  if (/^file:\/\//i.test(candidate)) {
-    const localFilePath = trySafeFileURLToPath(candidate);
-    if (localFilePath) {
-      candidate = localFilePath;
-    } else {
-      // Windows rejects posix-style file:///workspace/... in fileURLToPath; map via URL pathname
-      // when it clearly refers to the container workdir (same idea as sandbox-paths).
-      let parsed: URL;
-      try {
-        parsed = new URL(candidate);
-      } catch {
-        return filePath;
-      }
-      if (parsed.protocol !== "file:") {
-        return filePath;
-      }
-      const host = parsed.hostname.trim().toLowerCase();
-      if (host && host !== "localhost") {
-        return filePath;
-      }
-      if (hasEncodedFileUrlSeparator(parsed.pathname)) {
-        return filePath;
-      }
-      let normalizedPathname: string;
-      try {
-        normalizedPathname = decodeURIComponent(parsed.pathname).replace(/\\/g, "/");
-      } catch {
-        return filePath;
-      }
-      candidate = normalizedPathname;
-    }
-  }
-  return candidate;
-}
-
-function mapContainerPathToWorkspaceRoot(params: {
-  filePath: string;
-  root: string;
-  containerWorkdir?: string;
-}): string {
-  const candidate = resolveContainerPathCandidate(params.filePath);
-  const mapped =
-    params.containerWorkdir && candidate !== null
-      ? resolveSandboxPathMapping(
-          [{ hostRoot: params.root, containerRoot: params.containerWorkdir }],
-          candidate,
-        )
-      : null;
-  return mapped?.hostPath ?? candidate ?? params.filePath;
-}
-
-/** Resolve a model-supplied file path against the host workspace root. */
-function resolveToolPathAgainstWorkspaceRoot(params: {
-  filePath: string;
-  root: string;
-  containerWorkdir?: string;
-}): string {
-  const mapped = mapContainerPathToWorkspaceRoot(params);
-  const candidate = normalizeFileReferencePrefix(mapped);
-  if (isWindowsDrivePath(candidate)) {
-    return path.win32.normalize(candidate);
-  }
-  if (path.isAbsolute(candidate)) {
-    return path.resolve(candidate);
-  }
-  return path.resolve(params.root, candidate || ".");
-}
-
-type MemoryFlushAppendOnlyWriteOptions = {
-  root: string;
-  relativePath: string;
-  memoryWriteProvenance?: MemoryWriteProvenanceObserver;
-  containerWorkdir?: string;
-  sandbox?: {
-    root: string;
-    bridge: SandboxFsBridge;
-  };
-  operationalRunInstance?: OperationalRunInstanceRef;
-};
-
-async function readOptionalUtf8File(params: {
-  root: string;
-  relativePath: string;
-  sandbox?: MemoryFlushAppendOnlyWriteOptions["sandbox"];
-  signal?: AbortSignal;
-}): Promise<string> {
-  const dailyMemory = isDailyMemoryPath(params.relativePath);
-  try {
-    if (params.sandbox) {
-      const stat = await params.sandbox.bridge.stat({
-        filePath: params.relativePath,
-        cwd: params.sandbox.root,
-        signal: params.signal,
-      });
-      if (!stat) {
-        return "";
-      }
-      if (dailyMemory && stat.size > DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES) {
-        throw memoryFlushAppendRejected(
-          `existing daily memory file exceeds ${DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES} bytes; compact it before appending more memory-flush content.`,
-        );
-      }
-      const buffer = await params.sandbox.bridge.readFile({
-        filePath: params.relativePath,
-        cwd: params.sandbox.root,
-        signal: params.signal,
-        maxBytes: dailyMemory ? DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES : undefined,
-      });
-      return buffer.toString("utf-8");
-    }
-    if (!dailyMemory) {
-      return await fs.readFile(path.resolve(params.root, params.relativePath), "utf-8");
-    }
-    const root = await fsRoot(params.root);
-    const existing = await root.read(params.relativePath, {
-      hardlinks: "reject",
-      maxBytes: DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES,
-      nonBlockingRead: true,
-      symlinks: "reject",
-    });
-    return existing.buffer.toString("utf-8");
-  } catch (error) {
-    if (
-      dailyMemory &&
-      ((error instanceof FsSafeError && error.code === "too-large") ||
-        (error instanceof RangeError && error.message.includes("exceeds")))
-    ) {
-      throw memoryFlushAppendRejected(
-        `existing daily memory file exceeds ${DAILY_MEMORY_FLUSH_MAX_EXISTING_FILE_BYTES} bytes; compact it before appending more memory-flush content.`,
-      );
-    }
-    if (
-      (error as NodeJS.ErrnoException | undefined)?.code === "ENOENT" ||
-      (error instanceof FsSafeError && error.code === "not-found")
-    ) {
-      return "";
-    }
-    throw error;
-  }
-}
-
-async function appendMemoryFlushContent(params: {
-  root: string;
-  relativePath: string;
-  content: string;
-  sandbox?: MemoryFlushAppendOnlyWriteOptions["sandbox"];
-  signal?: AbortSignal;
-  assertCurrent: () => void;
-}) {
-  if (!params.sandbox) {
-    const root = await fsRoot(params.root);
-    params.assertCurrent();
-    await root.append(params.relativePath, params.content, {
-      mkdir: true,
-      prependNewlineIfNeeded: true,
-      assertBeforeMutation: params.assertCurrent,
-    });
-    return;
-  }
-
-  const existing = await readOptionalUtf8File({
-    root: params.root,
-    relativePath: params.relativePath,
-    sandbox: params.sandbox,
-    signal: params.signal,
-  });
-  const separator =
-    existing.length > 0 && !existing.endsWith("\n") && !params.content.startsWith("\n") ? "\n" : "";
-  const next = `${existing}${separator}${params.content}`;
-  const parent = path.posix.dirname(params.relativePath);
-  params.assertCurrent();
-  if (parent && parent !== ".") {
-    await params.sandbox.bridge.mkdirp({
-      filePath: parent,
-      cwd: params.sandbox.root,
-      signal: params.signal,
-    });
-  }
-  params.assertCurrent();
-  await params.sandbox.bridge.writeFile({
-    filePath: params.relativePath,
-    cwd: params.sandbox.root,
-    data: next,
-    mkdir: true,
-    signal: params.signal,
-  });
-}
-
-/** Restrict a write tool to appending memory-flush content to one path. */
-export function wrapToolMemoryFlushAppendOnlyWrite(
-  tool: AnyAgentTool,
-  options: MemoryFlushAppendOnlyWriteOptions,
-): AnyAgentTool {
-  const allowedAbsolutePath = path.resolve(options.root, options.relativePath);
-  const enforcement = options.operationalRunInstance
-    ? resolveMemoryFlushAppendEnforcement(options.operationalRunInstance)
-    : createMemoryFlushAppendEnforcement();
-  if (!enforcement) {
-    throw new Error("memory-flush append enforcement was not initialized for this admitted run");
-  }
-  return {
-    ...tool,
-    description: `${tool.description} During memory flush, this tool may only append to ${options.relativePath}.`,
-    execute: async (toolCallId, args, signal, onUpdate) => {
-      const assertCurrent = captureAgentToolSourceExecutionGuard(signal);
-      const record = getToolParamsRecord(args);
-      const normalizedRecord = record
-        ? await normalizeFileToolPathParamsFromKeys(
-            record,
-            ["path"],
-            options.root,
-            options.sandbox?.bridge,
-          )
-        : undefined;
-      assertRequiredParams(normalizedRecord, REQUIRED_PARAM_GROUPS.write, tool.name);
-      const filePath =
-        typeof normalizedRecord?.path === "string" && normalizedRecord.path.trim()
-          ? normalizedRecord.path
-          : undefined;
-      const content = typeof record?.content === "string" ? record.content : undefined;
-      if (!filePath || content === undefined) {
-        return tool.execute(toolCallId, args, signal, onUpdate);
-      }
-
-      const resolvedPath = resolveToolPathAgainstWorkspaceRoot({
-        filePath,
-        root: options.root,
-        containerWorkdir: options.containerWorkdir,
-      });
-      if (filePath.startsWith("@") || resolvedPath !== allowedAbsolutePath) {
-        throw new Error(
-          `Memory flush writes are restricted to ${options.relativePath}; use that path only.`,
-        );
-      }
-
-      const dailyMemory = isDailyMemoryPath(options.relativePath);
-      const appendPreparedContent = async () => {
-        assertCurrent();
-        const contentBefore = await readOptionalUtf8File({
-          root: options.root,
-          relativePath: options.relativePath,
-          sandbox: options.sandbox,
-          signal,
-        });
-        const preparedAppend = dailyMemory
-          ? prepareDailyMemoryFlushAppend({ content, existingContent: contentBefore })
-          : undefined;
-        const appendContent = preparedAppend?.content ?? content;
-        const separator =
-          contentBefore.length > 0 &&
-          !contentBefore.endsWith("\n") &&
-          !appendContent.startsWith("\n")
-            ? "\n"
-            : "";
-        const commitWithProvenance = async () => {
-          const commit = () =>
-            appendMemoryFlushContent({
-              root: options.root,
-              relativePath: options.relativePath,
-              content: appendContent,
-              sandbox: options.sandbox,
-              signal,
-              assertCurrent,
-            });
-          const memoryWriteProvenance = options.memoryWriteProvenance;
-          if (
-            memoryWriteProvenance &&
-            (await memoryWriteProvenance.classifies(allowedAbsolutePath))
-          ) {
-            await memoryWriteProvenance.write({
-              absolutePath: allowedAbsolutePath,
-              contentBefore,
-              contentAfter: `${contentBefore}${separator}${appendContent}`,
-              commit,
-            });
-          } else {
-            await commit();
-          }
-          // This wrapper inherits the write tool's output schema, so report only
-          // the authoritative `changed`; deriving `created` before append is racy.
-          return {
-            content: [
-              { type: "text" as const, text: `Appended content to ${options.relativePath}.` },
-            ],
-            details: { changed: true },
-          };
-        };
-        const result = preparedAppend
-          ? await enforcement({
-              appendChars: preparedAppend.appendChars,
-              commit: commitWithProvenance,
-            })
-          : await commitWithProvenance();
-        assertCurrent();
-        return result;
-      };
-
-      if (!dailyMemory) {
-        return await appendPreparedContent();
-      }
-
-      const canonicalRoot = await fs.realpath(options.root);
-      const expectedLockTarget = path.join(canonicalRoot, options.relativePath);
-      const resolvedLockTarget = await resolveAbsolutePathForWrite(expectedLockTarget, {
-        symlinks: "reject",
-      });
-      const lockTarget = resolvedLockTarget.canonicalPath;
-      if (lockTarget !== expectedLockTarget) {
-        throw new FsSafeError("symlink", "path traverses a symlink");
-      }
-      toRelativeWorkspacePath(canonicalRoot, lockTarget);
-      return await dailyMemoryFlushProcessLocks.enqueue(lockTarget, async () =>
-        withFileLock(lockTarget, DAILY_MEMORY_FLUSH_LOCK_OPTIONS, appendPreparedContent),
-      );
-    },
-  };
 }
 
 function isSandboxRootEscapeError(error: unknown): error is Error {

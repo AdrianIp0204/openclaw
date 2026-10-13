@@ -20,6 +20,7 @@ import { MAX_VISIBLE_MESSAGE_MAX_MESSAGES } from "../../config/sessions/session-
 import { waitForSessionTranscriptProjection } from "../../config/sessions/session-transcript-reconcile.js";
 import { createSessionTranscriptHeader } from "../../config/sessions/transcript-header.js";
 import type { ContextEngine } from "../../context-engine/types.js";
+import { FsSafeError } from "../../infra/fs-safe.js";
 import { readPendingUserTurnTranscriptAdmission } from "../../sessions/user-turn-transcript-admission.js";
 import { createUserTurnTranscriptRecorder } from "../../sessions/user-turn-transcript.js";
 import { withOpenClawTestState } from "../../test-utils/openclaw-test-state.js";
@@ -46,7 +47,10 @@ it.runIf(process.platform !== "win32").each(["symlink", "hardlink"] as const)(
           relativePath,
           assertCurrent: () => {},
         }),
-      ).rejects.toThrow(/symlink|hardlink|not-file|directory component/i);
+      ).rejects.toMatchObject({
+        name: FsSafeError.name,
+        code: alias === "symlink" ? "symlink" : "path-alias",
+      });
       await expect(fs.readFile(originalPath, "utf8")).resolves.toBe("original memory");
     });
   },
