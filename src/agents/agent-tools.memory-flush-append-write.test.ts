@@ -64,9 +64,10 @@ describe.each(["host", "sandbox"] as const)("%s append", (backend) => {
     ["reported oversized line", "x".repeat(1200)],
     ["UTF-16 length", "🐈".repeat(400) + "x"],
   ])(
-    "rejects %s before persistence, then accepts an exact-boundary delta",
+    "rejects %s without changing oversized legacy notes, then accepts an 800-unit delta",
     async (_name, content) => {
-      await seed("seed");
+      const legacy = `# Existing daily notes\r\n\r\n${"歷史🐈".repeat(300)}\r\nLegacy tail`;
+      await seed(legacy);
       const observe = vi.fn(async () => true);
       const persist = vi.fn(async ({ commit }: { commit: () => Promise<void> }) => commit());
       const tool = backendTool({
@@ -77,14 +78,14 @@ describe.each(["host", "sandbox"] as const)("%s append", (backend) => {
         },
       });
       await expect(write(tool, content)).rejects.toThrow(/max 800/);
-      expect(await read()).toBe("seed");
+      expect(await fs.readFile(absolute())).toEqual(Buffer.from(legacy));
       expect(observe).not.toHaveBeenCalled();
       expect(persist).not.toHaveBeenCalled();
 
       // Whitespace and CRLF count, but accepted content is never trimmed or rewritten.
       const accepted = `  ${"x".repeat(396)}\r\n${"y".repeat(399)}\n`;
       await write(tool, accepted);
-      expect(await read()).toBe(`seed\n${accepted}`);
+      expect(await fs.readFile(absolute())).toEqual(Buffer.from(`${legacy}\n${accepted}`));
       expect(persist).toHaveBeenCalledOnce();
     },
   );
