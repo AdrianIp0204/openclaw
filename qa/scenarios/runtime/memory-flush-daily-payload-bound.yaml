@@ -65,6 +65,11 @@ flow:
                 const accepted = "  " + "x".repeat(396) + "\r\n" + "y".repeat(399) + "\n";
                 const original = Buffer.from(legacy);
                 const expected = Buffer.from(legacy + "\n" + accepted);
+                const payloads = {
+                  qa_write_800: accepted,
+                  qa_write_801: "a".repeat(801),
+                  qa_write_1200: "b".repeat(1200),
+                };
                 check(legacy.length > 800 && accepted.length === 800, "Invalid fixture lengths");
                 await fs.mkdir(path.dirname(file), { recursive: true });
                 await fs.writeFile(file, original);
@@ -72,14 +77,22 @@ flow:
                 const observations = new Map();
                 const observes = (body, id) => {
                   const tool = lastTool(body);
-                  if (!isFlush(body) || tool?.tool_call_id !== id) return false;
+                  if (!isFlush(body) || !tool?.tool_call_id) return false;
+                  const call = body.messages.flatMap((message) => message.tool_calls ?? [])
+                    .findLast((call) => call.id === tool.tool_call_id);
+                  if (call?.function.name !== (id === "qa_read_legacy" ? "read" : "write")) return false;
+                  const args = JSON.parse(call.function.arguments);
+                  if (args.path !== relativePath || args.content !== payloads[id]) return false;
                   if (!observations.has(id)) {
-                    observations.set(id, { output: textOf(tool), bytes: readFileSync(file) });
+                    observations.set(id, {
+                      toolCallId: tool.tool_call_id, output: textOf(tool), bytes: readFileSync(file),
+                    });
                   }
                   return true;
                 };
-                const write = (id, content) => ({
-                  toolCalls: [{ id, name: "write", arguments: JSON.stringify({ path: relativePath, content }) }],
+                // Match real wire calls by arguments; Responses transport may reshape fixture IDs.
+                const write = (id) => ({
+                  toolCalls: [{ name: "write", arguments: JSON.stringify({ path: relativePath, content: payloads[id] }) }],
                 });
                 env.mock.addFixture({
                   match: { predicate: (body) => !isFlush(body) },
@@ -88,20 +101,20 @@ flow:
                 env.mock.addFixture({
                   match: { predicate: (body) => isFlush(body) && !lastTool(body) },
                   response: { toolCalls: [{
-                    id: "qa_read_legacy", name: "read", arguments: JSON.stringify({ path: relativePath }),
+                    name: "read", arguments: JSON.stringify({ path: relativePath }),
                   }] },
                 });
                 env.mock.addFixture({
                   match: { predicate: (body) => observes(body, "qa_read_legacy") },
-                  response: write("qa_write_800", accepted),
+                  response: write("qa_write_800"),
                 });
                 env.mock.addFixture({
                   match: { predicate: (body) => observes(body, "qa_write_800") },
-                  response: write("qa_write_801", "a".repeat(801)),
+                  response: write("qa_write_801"),
                 });
                 env.mock.addFixture({
                   match: { predicate: (body) => observes(body, "qa_write_801") },
-                  response: write("qa_write_1200", "b".repeat(1200)),
+                  response: write("qa_write_1200"),
                 });
                 env.mock.addFixture({
                   match: { predicate: (body) => observes(body, "qa_write_1200") },
@@ -115,10 +128,13 @@ flow:
                   const inbound = await transport.sendInbound({
                     conversation, senderId: "qa-operator", senderName: "QA Operator", text,
                   });
-                  const reply = await transport.waitForCompletedReply({
-                    inbound, gateway: env.gateway, timeoutMs: 60000,
-                  });
-                  check(reply.text.includes("QA_BOUNDARY_FOREGROUND_OK"), "Foreground reply missing");
+                  // A queue acknowledgement is not the eventual model-authored reply.
+                  await waitForCondition(async () => {
+                    const reply = await transport.waitForCompletedReply({
+                      inbound, gateway: env.gateway, timeoutMs: 60000,
+                    });
+                    return reply.text.includes("QA_BOUNDARY_FOREGROUND_OK") ? reply : undefined;
+                  }, 60000, 100);
                 }
                 await waitForCondition(() => observations.size === 4 ? true : undefined, 60000, 100);
                 const entry = await waitForCondition(async () => {
@@ -137,8 +153,8 @@ flow:
                 ].map(([id, units, allowed]) => {
                   const observed = observations.get(id);
                   check(observed.bytes.equals(expected), "Unexpected file bytes after " + id);
-                  const planned = journal.find((item) => item.plannedToolCallId === id);
-                  const result = journal.find((item) => item.toolOutputCallId === id);
+                  const planned = journal.find((item) => item.plannedToolCallId === observed.toolCallId);
+                  const result = journal.find((item) => item.toolOutputCallId === observed.toolCallId);
                   check(planned?.plannedToolName === "write" && result?.toolOutput === observed.output,
                     "Missing correlated real tool result for " + id);
                   const error = "Memory flush append rejected: content too large (" + units + " chars; max 800).";
